@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "spotify-control": {
+      "command": "/Users/vidit/Desktop/dev/mcp_spotify/venv/bin/python3",
+      "args": ["/Users/vidit/Desktop/dev/mcp_spotify/mcp_server.py"],
+      "env": {
+        "PYTHONPATH": "/Users/vidit/Desktop/dev/mcp_spotify:/Users/vidit/Desktop/dev/mcp_spotify/venv/lib/python3.13/site-packages"
+      }
+    }
+  }
+}
