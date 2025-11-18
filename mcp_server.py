@@ -27,6 +27,9 @@ from mcp.types import (
 )
 import mcp.types as types
 
+# Import AOP for observability
+from aop import AOPClient
+
 # Load environment variables
 load_dotenv()
 
@@ -50,6 +53,9 @@ except Exception as e:
 
 # Create the server instance
 server = Server("spotify-mcp-server")
+
+# Initialize AOP client for observability
+aop = AOPClient()
 
 def get_user_token():
     """Get the access token for the authenticated user."""
@@ -206,6 +212,337 @@ def search_multiple_tracks(access_token: str, song_queries: list):
     
     return track_uris, found_tracks
 
+# ============================================================================
+# AOP-WRAPPED TOOL FUNCTIONS
+# ============================================================================
+
+@aop.mcp.observe_tool(agent_id='spotify-mcp-server')
+async def tool_play_song(arguments: dict) -> list[types.TextContent]:
+    """AOP-wrapped play_song tool."""
+    access_token = get_user_token()
+    song_name = arguments.get("song_name", "")
+    artist_name = arguments.get("artist_name", "")
+
+    if not song_name:
+        return [types.TextContent(
+            type="text",
+            text="Error: Song name is required."
+        )]
+
+    # Search for the track
+    search_results = search_spotify_track(access_token, song_name, artist_name)
+    tracks = search_results.get("tracks", {}).get("items", [])
+
+    if not tracks:
+        return [types.TextContent(
+            type="text",
+            text=f"No songs found for '{song_name}' by '{artist_name}'" if artist_name else f"No songs found for '{song_name}'"
+        )]
+
+    # Play the first track
+    track = tracks[0]
+    track_uri = track["uri"]
+    response = play_spotify_track(access_token, track_uri)
+
+    if response.status_code == 204:
+        return [types.TextContent(
+            type="text",
+            text=f"✅ Now playing: '{track['name']}' by {', '.join(artist['name'] for artist in track['artists'])}"
+        )]
+    elif response.status_code == 403:
+        # Premium required error
+        return [types.TextContent(
+            type="text",
+            text=f"❌ Spotify Premium is required to control playback remotely.\n\n"
+                 f"However, I found the song you're looking for:\n"
+                 f"🎵 **{track['name']}** by {', '.join(artist['name'] for artist in track['artists'])}\n"
+                 f"📀 Album: {track['album']['name']}\n"
+                 f"🔗 You can play it manually in Spotify or upgrade to Premium for remote control."
+        )]
+    elif response.status_code == 404:
+        # Check available devices to provide better guidance
+        devices_info = get_available_devices(access_token)
+        if devices_info and devices_info.get('devices'):
+            devices = devices_info['devices']
+            active_devices = [d for d in devices if d.get('is_active')]
+            if not active_devices:
+                device_list = '\n'.join([f"- {d['name']} ({d['type']})" for d in devices])
+                return [types.TextContent(
+                    type="text",
+                    text=f"❌ No active Spotify device found. You have these devices available:\n{device_list}\n\nPlease start playing music on one of these devices first, then try again."
+                )]
+            else:
+                return [types.TextContent(
+                    type="text",
+                    text="❌ Could not play song. Try refreshing your Spotify app or restarting playback manually."
+                )]
+        else:
+            return [types.TextContent(
+                type="text",
+                text="❌ No Spotify devices found. Please open Spotify on your phone, computer, or another device and make sure you're logged in."
+            )]
+    else:
+        return [types.TextContent(
+            type="text",
+            text=f"❌ Could not play song (Error {response.status_code}). Make sure Spotify is active on one of your devices."
+        )]
+
+@aop.mcp.observe_tool(agent_id='spotify-mcp-server')
+async def tool_search_songs(arguments: dict) -> list[types.TextContent]:
+    """AOP-wrapped search_songs tool."""
+    access_token = get_user_token()
+    query = arguments.get("query", "")
+    if not query:
+        return [types.TextContent(
+            type="text",
+            text="Error: Search query is required."
+        )]
+
+    search_results = search_spotify_track(access_token, query)
+    tracks = search_results.get("tracks", {}).get("items", [])
+
+    if not tracks:
+        return [types.TextContent(
+            type="text",
+            text=f"No songs found for '{query}'"
+        )]
+
+    result_text = f"Found {len(tracks)} songs for '{query}':\n\n"
+    for i, track in enumerate(tracks, 1):
+        artists = ", ".join(artist['name'] for artist in track['artists'])
+        album = track['album']['name']
+        result_text += f"{i}. **{track['name']}** by {artists}\n   Album: {album}\n   Spotify URI: {track['uri']}\n\n"
+
+    return [types.TextContent(
+        type="text",
+        text=result_text
+    )]
+
+@aop.mcp.observe_tool(agent_id='spotify-mcp-server')
+async def tool_get_current_song(arguments: dict) -> list[types.TextContent]:
+    """AOP-wrapped get_current_song tool."""
+    access_token = get_user_token()
+    playback_info = get_current_playback(access_token)
+
+    if not playback_info or not playback_info.get('item'):
+        return [types.TextContent(
+            type="text",
+            text="No song is currently playing on Spotify."
+        )]
+
+    track = playback_info['item']
+    artists = ", ".join(artist['name'] for artist in track['artists'])
+    album = track['album']['name']
+    is_playing = playback_info.get('is_playing', False)
+    progress_ms = playback_info.get('progress_ms', 0)
+    duration_ms = track.get('duration_ms', 0)
+
+    progress_min = progress_ms // 60000
+    progress_sec = (progress_ms % 60000) // 1000
+    duration_min = duration_ms // 60000
+    duration_sec = (duration_ms % 60000) // 1000
+
+    status = "Playing" if is_playing else "Paused"
+
+    return [types.TextContent(
+        type="text",
+        text=f"🎵 **Currently {status}**: '{track['name']}' by {artists}\n"
+             f"📀 Album: {album}\n"
+             f"⏱️ Progress: {progress_min}:{progress_sec:02d} / {duration_min}:{duration_sec:02d}"
+    )]
+
+@aop.mcp.observe_tool(agent_id='spotify-mcp-server')
+async def tool_control_playback(arguments: dict) -> list[types.TextContent]:
+    """AOP-wrapped control_playback tool."""
+    access_token = get_user_token()
+    action = arguments.get("action", "")
+    if action not in ["play", "pause", "next", "previous"]:
+        return [types.TextContent(
+            type="text",
+            text="Error: Action must be one of: play, pause, next, previous"
+        )]
+
+    result = control_playback(access_token, action)
+
+    if result.get("status") == "success":
+        action_messages = {
+            "play": "▶️ Resumed playback",
+            "pause": "⏸️ Paused playback",
+            "next": "⏭️ Skipped to next track",
+            "previous": "⏮️ Went to previous track"
+        }
+        return [types.TextContent(
+            type="text",
+            text=action_messages.get(action, f"Performed action: {action}")
+        )]
+    elif result.get("response_code") == 403:
+        return [types.TextContent(
+            type="text",
+            text=f"❌ Spotify Premium is required for playback control ('{action}').\nYou can manually control playback in your Spotify app or upgrade to Premium."
+        )]
+    else:
+        return [types.TextContent(
+            type="text",
+            text=f"❌ Could not perform action '{action}'. Make sure Spotify is active and you have Premium."
+        )]
+
+@aop.mcp.observe_tool(agent_id='spotify-mcp-server')
+async def tool_get_devices(arguments: dict) -> list[types.TextContent]:
+    """AOP-wrapped get_devices tool."""
+    access_token = get_user_token()
+    devices_info = get_available_devices(access_token)
+
+    if not devices_info or not devices_info.get('devices'):
+        return [types.TextContent(
+            type="text",
+            text="❌ No Spotify devices found. Please open Spotify on your phone, computer, or another device and make sure you're logged in."
+        )]
+
+    devices = devices_info['devices']
+    if not devices:
+        return [types.TextContent(
+            type="text",
+            text="❌ No Spotify devices available. Please open Spotify on a device and make sure you're logged in."
+        )]
+
+    device_list = "📱 **Available Spotify Devices:**\n\n"
+    for device in devices:
+        status = "🟢 Active" if device.get('is_active') else "⚪ Inactive"
+        volume = device.get('volume_percent', 0)
+        device_list += f"• **{device['name']}** ({device['type']})\n"
+        device_list += f"  Status: {status} | Volume: {volume}%\n\n"
+
+    active_count = len([d for d in devices if d.get('is_active')])
+    if active_count == 0:
+        device_list += "⚠️ **No active devices found.** To play music:\n"
+        device_list += "1. Open Spotify on one of the devices above\n"
+        device_list += "2. Start playing any song (you can pause it after)\n"
+        device_list += "3. Then try your music request again"
+
+    return [types.TextContent(
+        type="text",
+        text=device_list
+    )]
+
+@aop.mcp.observe_tool(agent_id='spotify-mcp-server')
+async def tool_create_playlist(arguments: dict) -> list[types.TextContent]:
+    """AOP-wrapped create_playlist tool."""
+    access_token = get_user_token()
+    playlist_name = arguments.get("playlist_name", "")
+    description = arguments.get("description", "")
+    public = arguments.get("public", True)
+    songs = arguments.get("songs", [])
+
+    if not playlist_name:
+        return [types.TextContent(
+            type="text",
+            text="Error: Playlist name is required."
+        )]
+
+    # Create the playlist
+    playlist_response = create_playlist(access_token, playlist_name, description, public)
+
+    if playlist_response.status_code == 201:
+        playlist_data = playlist_response.json()
+        playlist_id = playlist_data["id"]
+        playlist_url = playlist_data["external_urls"]["spotify"]
+
+        result_text = f"✅ Created playlist: **{playlist_name}**\n"
+        result_text += f"🔗 URL: {playlist_url}\n"
+
+        # Add songs if provided
+        if songs:
+            track_uris, found_tracks = search_multiple_tracks(access_token, songs)
+
+            if track_uris:
+                add_response = add_tracks_to_playlist(access_token, playlist_id, track_uris)
+
+                if add_response.status_code == 201:
+                    result_text += f"\n🎵 Added {len(found_tracks)} songs:\n"
+                    for track in found_tracks:
+                        result_text += f"• {track['name']} by {', '.join(track['artists'])}\n"
+                else:
+                    result_text += f"\n⚠️ Playlist created but failed to add songs (Error {add_response.status_code})"
+            else:
+                result_text += f"\n⚠️ Playlist created but no songs were found to add"
+
+        return [types.TextContent(
+            type="text",
+            text=result_text
+        )]
+    else:
+        return [types.TextContent(
+            type="text",
+            text=f"❌ Failed to create playlist (Error {playlist_response.status_code}). Make sure you have proper permissions."
+        )]
+
+@aop.mcp.observe_tool(agent_id='spotify-mcp-server')
+async def tool_add_songs_to_playlist(arguments: dict) -> list[types.TextContent]:
+    """AOP-wrapped add_songs_to_playlist tool."""
+    access_token = get_user_token()
+    playlist_name = arguments.get("playlist_name", "")
+    songs = arguments.get("songs", [])
+
+    if not playlist_name or not songs:
+        return [types.TextContent(
+            type="text",
+            text="Error: Both playlist name and songs are required."
+        )]
+
+    # First, find the playlist by name
+    headers = {"Authorization": f"Bearer {access_token}"}
+    playlists_response = requests.get("https://api.spotify.com/v1/me/playlists", headers=headers)
+
+    if playlists_response.status_code != 200:
+        return [types.TextContent(
+            type="text",
+            text="❌ Failed to get your playlists."
+        )]
+
+    playlists_data = playlists_response.json()
+    target_playlist = None
+
+    for playlist in playlists_data.get("items", []):
+        if playlist["name"].lower() == playlist_name.lower():
+            target_playlist = playlist
+            break
+
+    if not target_playlist:
+        return [types.TextContent(
+            type="text",
+            text=f"❌ Playlist '{playlist_name}' not found in your library."
+        )]
+
+    # Search for songs and add them
+    track_uris, found_tracks = search_multiple_tracks(access_token, songs)
+
+    if not track_uris:
+        return [types.TextContent(
+            type="text",
+            text="❌ None of the requested songs were found."
+        )]
+
+    # Add tracks to playlist
+    add_response = add_tracks_to_playlist(access_token, target_playlist["id"], track_uris)
+
+    if add_response.status_code == 201:
+        result_text = f"✅ Added {len(found_tracks)} songs to **{playlist_name}**:\n\n"
+        for track in found_tracks:
+            result_text += f"• {track['name']} by {', '.join(track['artists'])}\n"
+
+        if len(found_tracks) < len(songs):
+            result_text += f"\n⚠️ {len(songs) - len(found_tracks)} song(s) could not be found and were skipped."
+
+        return [types.TextContent(
+            type="text",
+            text=result_text
+        )]
+    else:
+        return [types.TextContent(
+            type="text",
+            text=f"❌ Failed to add songs to playlist (Error {add_response.status_code})."
+        )]
+
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     """List available tools."""
@@ -323,322 +660,36 @@ async def handle_list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
-    """Handle tool calls."""
+    """Handle tool calls - routes to AOP-wrapped tool functions."""
     try:
-        access_token = get_user_token()
-        
+        # Route to appropriate AOP-wrapped tool function
         if name == "play_song":
-            song_name = arguments.get("song_name", "")
-            artist_name = arguments.get("artist_name", "")
-            
-            if not song_name:
-                return [types.TextContent(
-                    type="text",
-                    text="Error: Song name is required."
-                )]
-            
-            # Search for the track
-            search_results = search_spotify_track(access_token, song_name, artist_name)
-            tracks = search_results.get("tracks", {}).get("items", [])
-            
-            if not tracks:
-                return [types.TextContent(
-                    type="text",
-                    text=f"No songs found for '{song_name}' by '{artist_name}'" if artist_name else f"No songs found for '{song_name}'"
-                )]
-            
-            # Play the first track
-            track = tracks[0]
-            track_uri = track["uri"]
-            response = play_spotify_track(access_token, track_uri)
-            
-            if response.status_code == 204:
-                return [types.TextContent(
-                    type="text",
-                    text=f"✅ Now playing: '{track['name']}' by {', '.join(artist['name'] for artist in track['artists'])}"
-                )]
-            elif response.status_code == 403:
-                # Premium required error
-                return [types.TextContent(
-                    type="text",
-                    text=f"❌ Spotify Premium is required to control playback remotely.\n\n"
-                         f"However, I found the song you're looking for:\n"
-                         f"🎵 **{track['name']}** by {', '.join(artist['name'] for artist in track['artists'])}\n"
-                         f"📀 Album: {track['album']['name']}\n"
-                         f"🔗 You can play it manually in Spotify or upgrade to Premium for remote control."
-                )]
-            elif response.status_code == 404:
-                # Check available devices to provide better guidance
-                devices_info = get_available_devices(access_token)
-                if devices_info and devices_info.get('devices'):
-                    devices = devices_info['devices']
-                    active_devices = [d for d in devices if d.get('is_active')]
-                    if not active_devices:
-                        device_list = '\n'.join([f"- {d['name']} ({d['type']})" for d in devices])
-                        return [types.TextContent(
-                            type="text",
-                            text=f"❌ No active Spotify device found. You have these devices available:\n{device_list}\n\nPlease start playing music on one of these devices first, then try again."
-                        )]
-                    else:
-                        return [types.TextContent(
-                            type="text",
-                            text="❌ Could not play song. Try refreshing your Spotify app or restarting playback manually."
-                        )]
-                else:
-                    return [types.TextContent(
-                        type="text",
-                        text="❌ No Spotify devices found. Please open Spotify on your phone, computer, or another device and make sure you're logged in."
-                    )]
-            else:
-                return [types.TextContent(
-                    type="text",
-                    text=f"❌ Could not play song (Error {response.status_code}). Make sure Spotify is active on one of your devices."
-                )]
-        
+            return await tool_play_song(arguments or {})
+
         elif name == "search_songs":
-            query = arguments.get("query", "")
-            if not query:
-                return [types.TextContent(
-                    type="text",
-                    text="Error: Search query is required."
-                )]
-            
-            search_results = search_spotify_track(access_token, query)
-            tracks = search_results.get("tracks", {}).get("items", [])
-            
-            if not tracks:
-                return [types.TextContent(
-                    type="text",
-                    text=f"No songs found for '{query}'"
-                )]
-            
-            result_text = f"Found {len(tracks)} songs for '{query}':\n\n"
-            for i, track in enumerate(tracks, 1):
-                artists = ", ".join(artist['name'] for artist in track['artists'])
-                album = track['album']['name']
-                result_text += f"{i}. **{track['name']}** by {artists}\n   Album: {album}\n   Spotify URI: {track['uri']}\n\n"
-            
-            return [types.TextContent(
-                type="text",
-                text=result_text
-            )]
-        
+            return await tool_search_songs(arguments or {})
+
         elif name == "get_current_song":
-            playback_info = get_current_playback(access_token)
-            
-            if not playback_info or not playback_info.get('item'):
-                return [types.TextContent(
-                    type="text",
-                    text="No song is currently playing on Spotify."
-                )]
-            
-            track = playback_info['item']
-            artists = ", ".join(artist['name'] for artist in track['artists'])
-            album = track['album']['name']
-            is_playing = playback_info.get('is_playing', False)
-            progress_ms = playback_info.get('progress_ms', 0)
-            duration_ms = track.get('duration_ms', 0)
-            
-            progress_min = progress_ms // 60000
-            progress_sec = (progress_ms % 60000) // 1000
-            duration_min = duration_ms // 60000
-            duration_sec = (duration_ms % 60000) // 1000
-            
-            status = "Playing" if is_playing else "Paused"
-            
-            return [types.TextContent(
-                type="text",
-                text=f"🎵 **Currently {status}**: '{track['name']}' by {artists}\n"
-                     f"📀 Album: {album}\n"
-                     f"⏱️ Progress: {progress_min}:{progress_sec:02d} / {duration_min}:{duration_sec:02d}"
-            )]
-        
+            return await tool_get_current_song(arguments or {})
+
         elif name == "control_playback":
-            action = arguments.get("action", "")
-            if action not in ["play", "pause", "next", "previous"]:
-                return [types.TextContent(
-                    type="text",
-                    text="Error: Action must be one of: play, pause, next, previous"
-                )]
-            
-            result = control_playback(access_token, action)
-            
-            if result.get("status") == "success":
-                action_messages = {
-                    "play": "▶️ Resumed playback",
-                    "pause": "⏸️ Paused playback", 
-                    "next": "⏭️ Skipped to next track",
-                    "previous": "⏮️ Went to previous track"
-                }
-                return [types.TextContent(
-                    type="text",
-                    text=action_messages.get(action, f"Performed action: {action}")
-                )]
-            elif result.get("response_code") == 403:
-                return [types.TextContent(
-                    type="text",
-                    text=f"❌ Spotify Premium is required for playback control ('{action}').\nYou can manually control playback in your Spotify app or upgrade to Premium."
-                )]
-            else:
-                return [types.TextContent(
-                    type="text",
-                    text=f"❌ Could not perform action '{action}'. Make sure Spotify is active and you have Premium."
-                )]
-        
+            return await tool_control_playback(arguments or {})
+
         elif name == "get_devices":
-            devices_info = get_available_devices(access_token)
-            
-            if not devices_info or not devices_info.get('devices'):
-                return [types.TextContent(
-                    type="text",
-                    text="❌ No Spotify devices found. Please open Spotify on your phone, computer, or another device and make sure you're logged in."
-                )]
-            
-            devices = devices_info['devices']
-            if not devices:
-                return [types.TextContent(
-                    type="text",
-                    text="❌ No Spotify devices available. Please open Spotify on a device and make sure you're logged in."
-                )]
-            
-            device_list = "📱 **Available Spotify Devices:**\n\n"
-            for device in devices:
-                status = "🟢 Active" if device.get('is_active') else "⚪ Inactive"
-                volume = device.get('volume_percent', 0)
-                device_list += f"• **{device['name']}** ({device['type']})\n"
-                device_list += f"  Status: {status} | Volume: {volume}%\n\n"
-            
-            active_count = len([d for d in devices if d.get('is_active')])
-            if active_count == 0:
-                device_list += "⚠️ **No active devices found.** To play music:\n"
-                device_list += "1. Open Spotify on one of the devices above\n"
-                device_list += "2. Start playing any song (you can pause it after)\n"
-                device_list += "3. Then try your music request again"
-            
-            return [types.TextContent(
-                type="text",
-                text=device_list
-            )]
-        
+            return await tool_get_devices(arguments or {})
+
         elif name == "create_playlist":
-            playlist_name = arguments.get("playlist_name", "")
-            description = arguments.get("description", "")
-            public = arguments.get("public", True)
-            songs = arguments.get("songs", [])
-            
-            if not playlist_name:
-                return [types.TextContent(
-                    type="text",
-                    text="Error: Playlist name is required."
-                )]
-            
-            # Create the playlist
-            playlist_response = create_playlist(access_token, playlist_name, description, public)
-            
-            if playlist_response.status_code == 201:
-                playlist_data = playlist_response.json()
-                playlist_id = playlist_data["id"]
-                playlist_url = playlist_data["external_urls"]["spotify"]
-                
-                result_text = f"✅ Created playlist: **{playlist_name}**\n"
-                result_text += f"🔗 URL: {playlist_url}\n"
-                
-                # Add songs if provided
-                if songs:
-                    track_uris, found_tracks = search_multiple_tracks(access_token, songs)
-                    
-                    if track_uris:
-                        add_response = add_tracks_to_playlist(access_token, playlist_id, track_uris)
-                        
-                        if add_response.status_code == 201:
-                            result_text += f"\n🎵 Added {len(found_tracks)} songs:\n"
-                            for track in found_tracks:
-                                result_text += f"• {track['name']} by {', '.join(track['artists'])}\n"
-                        else:
-                            result_text += f"\n⚠️ Playlist created but failed to add songs (Error {add_response.status_code})"
-                    else:
-                        result_text += f"\n⚠️ Playlist created but no songs were found to add"
-                
-                return [types.TextContent(
-                    type="text",
-                    text=result_text
-                )]
-            else:
-                return [types.TextContent(
-                    type="text",
-                    text=f"❌ Failed to create playlist (Error {playlist_response.status_code}). Make sure you have proper permissions."
-                )]
-        
+            return await tool_create_playlist(arguments or {})
+
         elif name == "add_songs_to_playlist":
-            playlist_name = arguments.get("playlist_name", "")
-            songs = arguments.get("songs", [])
-            
-            if not playlist_name or not songs:
-                return [types.TextContent(
-                    type="text",
-                    text="Error: Both playlist name and songs are required."
-                )]
-            
-            # First, find the playlist by name
-            headers = {"Authorization": f"Bearer {access_token}"}
-            playlists_response = requests.get("https://api.spotify.com/v1/me/playlists", headers=headers)
-            
-            if playlists_response.status_code != 200:
-                return [types.TextContent(
-                    type="text",
-                    text="❌ Failed to get your playlists."
-                )]
-            
-            playlists_data = playlists_response.json()
-            target_playlist = None
-            
-            for playlist in playlists_data.get("items", []):
-                if playlist["name"].lower() == playlist_name.lower():
-                    target_playlist = playlist
-                    break
-            
-            if not target_playlist:
-                return [types.TextContent(
-                    type="text",
-                    text=f"❌ Playlist '{playlist_name}' not found in your library."
-                )]
-            
-            # Search for songs and add them
-            track_uris, found_tracks = search_multiple_tracks(access_token, songs)
-            
-            if not track_uris:
-                return [types.TextContent(
-                    type="text",
-                    text="❌ None of the requested songs were found."
-                )]
-            
-            # Add tracks to playlist
-            add_response = add_tracks_to_playlist(access_token, target_playlist["id"], track_uris)
-            
-            if add_response.status_code == 201:
-                result_text = f"✅ Added {len(found_tracks)} songs to **{playlist_name}**:\n\n"
-                for track in found_tracks:
-                    result_text += f"• {track['name']} by {', '.join(track['artists'])}\n"
-                
-                if len(found_tracks) < len(songs):
-                    result_text += f"\n⚠️ {len(songs) - len(found_tracks)} song(s) could not be found and were skipped."
-                
-                return [types.TextContent(
-                    type="text",
-                    text=result_text
-                )]
-            else:
-                return [types.TextContent(
-                    type="text",
-                    text=f"❌ Failed to add songs to playlist (Error {add_response.status_code})."
-                )]
-        
+            return await tool_add_songs_to_playlist(arguments or {})
+
         else:
             return [types.TextContent(
                 type="text",
                 text=f"Unknown tool: {name}"
             )]
-            
+
     except Exception as e:
         return [types.TextContent(
             type="text",
